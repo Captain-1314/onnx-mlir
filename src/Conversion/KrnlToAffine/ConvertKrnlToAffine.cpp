@@ -17,6 +17,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -1611,9 +1612,12 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   target.addLegalOp<AffineStoreOp>();
   target.addLegalOp<KrnlVectorTypeCastOp>();
   target.addLegalOp<UnrealizedConversionCastOp>();
+  // scf 必须合法：matmul 的向量化 lowering 现在用 scf.for 的 iter_args 承载
+  // 寄存器累加器，其 scf.yield 带操作数，如果不把 scf 标为合法，
+  // 生成出来的 yield 会 "no matched legalization pattern" 而整体回滚。
   target.addLegalDialect<mlir::affine::AffineDialect, mlir::arith::ArithDialect,
       mlir::memref::MemRefDialect, mlir::func::FuncDialect,
-      mlir::vector::VectorDialect>();
+      mlir::scf::SCFDialect, mlir::vector::VectorDialect>();
 
   // Patterns.
   RewritePatternSet patterns(ctx);

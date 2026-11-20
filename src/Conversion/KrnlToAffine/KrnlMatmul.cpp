@@ -14,6 +14,7 @@
 
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "src/Conversion/KrnlToAffine/ConvertKrnlToAffine.hpp"
@@ -527,43 +528,98 @@ private:
     int64_t unrollFactor = (unrollJam && I.isLiteral()) ? I.getLiteral() : 1;
 
     // Iterates over the I indices (j are simd dim).
-    Value iSaved, kSaved;
+    Value iSaved;
     LiteralIndexExpr zeroIE(0);
+    LiteralIndexExpr oneIE(1);
     Value iZero = create.math.constantIndex(0);
+
+    // ---------- 多累加器版本（iTrip 为编译期常量时）----------
+    // 把 k 循环提到最外层，为每个 i 行准备一个独立的向量累加器（scf.for 的
+    // iter_args）。这样一轮 k 里有 iLit 个互不依赖的 fma 可以重叠发射，
+    // 既避免了「累加器在内存里每轮 k 往返一次」，也不会因为单一累加器把
+    // fma 的 4 周期延迟暴露成吞吐瓶颈。
+    if (I.isLiteral() && I.getLiteral() > 0) {
+      int64_t iLit = I.getLiteral();
+      MultiDialectBuilder<MathBuilder, VectorBuilder> create2(createAffine);
+      SmallVector<Value, 8> initVals;
+      for (int64_t i = 0; i < iLit; ++i) {
+        Value iVal = create2.math.constantIndex(i);
+        initVals.emplace_back(create2.vec.loadIE(vecType, C, cStart, {iVal, iZero}));
+      }
+      auto forOp = mlir::scf::ForOp::create(
+          createAffine.getBuilder(), createAffine.getLoc(), zeroIE.getValue(),
+          K.getValue(), oneIE.getValue(), initVals,
+          [&](OpBuilder &bld, Location l, Value k, ValueRange iters) {
+            AffineBuilderKrnlMem createAffine2(bld, l);
+            MultiDialectBuilder<MathBuilder, VectorBuilder> create3(bld, l);
+            // B 的一列整块只读一次，所有 i 行共用。
+            Value vb = create3.vec.loadIE(vecType, B, bStart, {k, iZero});
+            SmallVector<Value, 8> yields;
+            for (int64_t i = 0; i < iLit; ++i) {
+              Value iVal = create3.math.constantIndex(i);
+              Value a = createAffine2.loadIE(A, aStart, {iVal, k});
+              Value va = create3.vec.broadcast(vecType, a);
+              Value res;
+              if (isa<FloatType>(elementType)) {
+                res = create3.vec.fma(va, vb, iters[i]);
+              } else {
+                res = create3.math.add(create3.math.mul(va, vb), iters[i]);
+              }
+              yields.emplace_back(res);
+            }
+            mlir::scf::YieldOp::create(bld, l, yields);
+          });
+      // 循环出口：iLit 个累加器一次性写回 C。
+      int64_t JLit = J.getLiteral();
+      for (int64_t i = 0; i < iLit; ++i) {
+        Value iVal = create2.math.constantIndex(i);
+        Value tmpResults = forOp.getResult(i);
+        if (JLit != VL) {
+          SmallVector<int64_t, 8> mask;
+          for (int64_t t = 0; t < VL; t++)
+            mask.emplace_back((t < JLit) ? t : VL + t);
+          Value originalCvec =
+              create2.vec.loadIE(vecType, C, cStart, {iVal, iZero});
+          tmpResults = create2.vec.shuffle(tmpResults, originalCvec, mask);
+        }
+        create2.vec.storeIE(tmpResults, C, cStart, {iVal, iZero});
+      }
+      return;
+    }
 
     createAffine.forLoopIE(zeroIE, I, 1,
         [&](const AffineBuilderKrnlMem &createAffine, ValueRange loopInd) {
           MultiDialectBuilder<MathBuilder, VectorBuilder> create(createAffine);
           Value i = loopInd[0];
           iSaved = i; // Saved for unroll and jam.
-          // Alloc temp vector TmpC and save C(i)/0.0 into it.
+          // Sum over k，累加器驻留寄存器：用 scf.for 的 iter_args 承载向量累加器。
+          // 旧实现是「load(TmpC) -> fma -> store(TmpC)」，每轮 k 一次内存往返，
+          // 生成出来的机器码等价于把累加器钉在栈上，向量单元空转等 load；
+          // 改成 iter_args 后整个 k 循环只有首尾两次内存访问。
           Value initVal = create.vec.loadIE(vecType, C, cStart, {i, iZero});
-          Value tmpCAccess = (unrollFactor > 1) ? i : zeroIE.getValue();
-          createAffine.store(initVal, TmpC, tmpCAccess);
-          // Sum over k.
-          createAffine.forLoopIE(zeroIE, K, 1,
-              [&](const AffineBuilderKrnlMem &createAffine,
-                  ValueRange loopInd) {
-                MultiDialectBuilder<MathBuilder, VectorBuilder> create(
-                    createAffine);
-                Value k = loopInd[0];
-                kSaved = k;
-                Value a = createAffine.loadIE(A, aStart, {i, k});
-                Value va = create.vec.broadcast(vecType, a);
-                Value vb = create.vec.loadIE(vecType, B, bStart, {k, iZero});
-                // TTmpC() = vector_fma(va, vb, TTmpC());
-                Value tmpVal = createAffine.load(TmpC, tmpCAccess);
+          Value ub = K.getValue();
+          Value step = oneIE.getValue();
+          auto forOp = mlir::scf::ForOp::create(
+              createAffine.getBuilder(), createAffine.getLoc(), zeroIE.getValue(), ub, step,
+              ValueRange{initVal},
+              [&](OpBuilder &bld, Location l, Value k, ValueRange iterArgs) {
+                AffineBuilderKrnlMem createAffine2(bld, l);
+                MultiDialectBuilder<MathBuilder, VectorBuilder> create2(bld, l);
+                Value acc = iterArgs[0];
+                Value a = createAffine2.loadIE(A, aStart, {i, k});
+                Value va = create2.vec.broadcast(vecType, a);
+                Value vb = create2.vec.loadIE(vecType, B, bStart, {k, iZero});
                 Value res;
                 if (isa<FloatType>(elementType)) {
-                  res = create.vec.fma(va, vb, tmpVal);
+                  res = create2.vec.fma(va, vb, acc);
                 } else {
-                  res = create.math.mul(va, vb);
-                  res = create.math.add(res, tmpVal);
+                  res = create2.math.mul(va, vb);
+                  res = create2.math.add(res, acc);
                 }
-                createAffine.store(res, TmpC, tmpCAccess);
+                mlir::scf::YieldOp::create(bld, l, res);
               });
-          // Store temp result into C(i)
-          Value tmpResults = createAffine.load(TmpC, tmpCAccess);
+          // 循环出口：累加器从寄存器里拿出来（只有这一次）
+          Value tmpResults = forOp.getResult(0);
           int64_t JLit = J.getLiteral();
           if (JLit != VL) {
             // create vector constant
@@ -580,27 +636,9 @@ private:
 
     if (unrollJam && (I.isLiteral() || K.isLiteral())) {
       auto list = getUnrollAndJamList(op);
-      if (K.isLiteral()) {
-        int64_t kUnroll = K.getLiteral();
-        // We know there is no unrolling along I, make a bigger cutoff.
-        int64_t cutoff = (!I.isLiteral() || I.getLiteral() < 2) ? 8 : 4;
-        if (kUnroll >= cutoff) {
-          // When kUnroll is too big, reduce it by a divisor.
-          for (int64_t m = cutoff; m >= 1; --m) {
-            if (kUnroll % m == 0) {
-              kUnroll = m;
-              break;
-            }
-          }
-        }
-        if (kUnroll > 1) {
-          LLVM_DEBUG(
-              llvm::dbgs() << "Matmul: unroll k by " << kUnroll << "\n";);
-          UnrollAndJamRecord record(
-              affine::getForInductionVarOwner(kSaved), kUnroll);
-          list->emplace_back(record);
-        }
-      }
+      // 注意：k 方向不再注册 unroll-and-jam。累加器已用 iter_args 驻留寄存器，
+      // 对带 region 结果的循环做 unroll-and-jam 会把 iter_args 复制成多份，
+      // 反而重新引入寄存器压力（f16 8×16 下实测收益为负）。
       if (I.isLiteral() && I.getLiteral() > 1) {
         LLVM_DEBUG(llvm::dbgs()
                    << "Matmul: unroll i by " << (int)I.getLiteral() << "\n");
