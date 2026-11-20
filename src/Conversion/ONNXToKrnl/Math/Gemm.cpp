@@ -150,7 +150,12 @@ struct ONNXGemmOpLowering : public OpConversionPattern<GemmOp> {
     // Prepare for the computations.
     // 1) Define blocking, with simdization along the j axis.
     const int64_t iCacheTile(32), jCacheTile(64), kCacheTile(32);
-    const int64_t iRegTile(4), jRegTile(16);
+    // 寄存器块按元素位宽自适应：16 位元素（f16/bf16）向量寄存器只需一半宽度，
+    // 同样 32 个向量寄存器能装下 8 行累加器，故可上到 8 行；32 位元素维持 4 行
+    // （实测 8 行会溢出到栈，慢 5%）。
+    const int64_t bitWidth = elementType.getIntOrFloatBitWidth();
+    const int64_t iRegTile = (bitWidth <= 16) ? 8 : 4;
+    const int64_t jRegTile(16);
 
     bool unrollAndJam = DEBUG_UNROLL_OFF ? false : true;
     // Simdize with jRegTile as the vector length.

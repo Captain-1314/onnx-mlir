@@ -709,6 +709,9 @@ TypedAttr MathBuilder::negativeInfAttr(Type type) const {
       .Case<Float32Type>([&](Type) {
         attr = b().getF32FloatAttr(-std::numeric_limits<float>::infinity());
       })
+      .Case<Float16Type>([&](Type) {
+        attr = b().getF16FloatAttr(-std::numeric_limits<float>::infinity());
+      })
       .Case<Float64Type>([&](Type) {
         attr = b().getF64FloatAttr(-std::numeric_limits<double>::infinity());
       })
@@ -753,6 +756,9 @@ TypedAttr MathBuilder::positiveInfAttr(Type type) const {
   TypeSwitch<Type>(type)
       .Case<Float32Type>([&](Type) {
         attr = b().getF32FloatAttr(std::numeric_limits<float>::infinity());
+      })
+      .Case<Float16Type>([&](Type) {
+        attr = b().getF16FloatAttr(std::numeric_limits<float>::infinity());
       })
       .Case<Float64Type>([&](Type) {
         attr = b().getF64FloatAttr(std::numeric_limits<double>::infinity());
